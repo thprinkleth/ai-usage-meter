@@ -2,7 +2,16 @@
   "name": "ai-usage-meter",
   "version": "1.0.0",
   "description": "Local browser dashboard for Claude Code and Codex usage, covering every ccusage report",
-  "keywords": ["claude", "claude-code", "codex", "ccusage", "usage", "tokens", "cost", "dashboard"],
+  "keywords": [
+    "claude",
+    "claude-code",
+    "codex",
+    "ccusage",
+    "usage",
+    "tokens",
+    "cost",
+    "dashboard"
+  ],
   "license": "MIT",
   "author": "Shiro",
   "repository": {
@@ -15,7 +24,11 @@
   "bin": {
     "ai-usage-meter": "bin/ai-usage-meter.js"
   },
-  "files": ["server.js", "bin", "public"],
+  "files": [
+    "server.js",
+    "bin",
+    "public"
+  ],
   "engines": {
     "node": ">=18.17"
   },
@@ -25,7 +38,6 @@
     "update-ccusage": "npm i ccusage@latest"
   },
   "dependencies": {
-    "ccusage": "^20.0.44",
-    "chart.js": "^4.4.7"
+    "ccusage": "^20.0.44"
   }
 }

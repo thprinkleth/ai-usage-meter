@@ -147,6 +147,19 @@ main { min-width: 0; padding: 22px 28px 60px; }
 .swatch { width: 9px; height: 9px; border-radius: 3px; display: inline-block; flex: none; }
 
 .chart-box { position: relative; height: 300px; }
+.chart { position: absolute; inset: 0; user-select: none; }
+.chart svg { display: block; overflow: visible; }
+.chart .ct { fill: var(--muted); font: 11px var(--font); font-variant-numeric: tabular-nums; }
+.chart .hl { opacity: .7; }
+.chart-tip {
+	position: absolute; z-index: 5; pointer-events: none; min-width: 150px;
+	background: var(--surface); border: 1px solid var(--grid); border-radius: 8px;
+	padding: 8px 10px; font-size: 12.5px; box-shadow: 0 6px 20px rgba(0, 0, 0, .18);
+}
+.chart-tip .tt-title { font-weight: 600; margin-bottom: 4px; white-space: nowrap; }
+.chart-tip .tt-row { display: flex; align-items: center; gap: 7px; color: var(--ink-2); white-space: nowrap; }
+.chart-tip .tt-row b { margin-left: auto; padding-left: 14px; color: var(--ink); font-variant-numeric: tabular-nums; }
+.chart-tip .tt-total { border-top: 1px solid var(--grid); margin-top: 4px; padding-top: 4px; color: var(--ink); }
 .chart-box.tall { height: 380px; }
 .chart-box.short { height: 220px; }
 

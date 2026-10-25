@@ -194,10 +194,6 @@ async function cachedRun(args, opts, fresh) {
 }
 
 const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.svg': 'image/svg+xml', '.json': 'application/json' };
-const STATIC = {
-	// Resolved through the package entry so it also works when npx hoists dependencies.
-	'/vendor/chart.umd.js': path.join(path.dirname(require.resolve('chart.js')), 'chart.umd.js'),
-};
 
 function send(res, status, body, type = 'application/json') {
 	res.writeHead(status, { 'content-type': type, 'cache-control': 'no-store', 'x-content-type-options': 'nosniff' });
@@ -268,12 +264,9 @@ const server = createServer(async (req, res) => {
 		}
 
 		if (req.method !== 'GET') return send(res, 405, { error: 'Method not allowed' });
-		let file = STATIC[url.pathname];
-		if (!file) {
-			const rel = url.pathname === '/' ? 'index.html' : decodeURIComponent(url.pathname).replace(/^\/+/, '');
-			file = path.join(ROOT, 'public', rel);
-			if (!file.startsWith(path.join(ROOT, 'public') + path.sep)) return send(res, 403, { error: 'Forbidden' });
-		}
+		const rel = url.pathname === '/' ? 'index.html' : decodeURIComponent(url.pathname).replace(/^\/+/, '');
+		const file = path.join(ROOT, 'public', rel);
+		if (!file.startsWith(path.join(ROOT, 'public') + path.sep)) return send(res, 403, { error: 'Forbidden' });
 		if (!existsSync(file) || !statSync(file).isFile()) return send(res, 404, 'Not found', 'text/plain');
 		return send(res, 200, readFileSync(file), MIME[path.extname(file)] || 'application/octet-stream');
 	} catch (e) {

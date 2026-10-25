@@ -240,7 +240,7 @@ function overviewDaily(rows) {
 			<div class="seg" id="ov-range">${[[7, '7D'], [30, '30D'], [90, '90D'], [0, 'All']].map(([k, l]) => `<button data-k="${k}" class="${range === k ? 'on' : ''}">${l}</button>`).join('')}</div>
 		</div>
 		<div id="ov-legend"></div>
-		<div class="chart-box"><canvas></canvas></div>`;
+		<div class="chart-box"><div class="chart"></div></div>`;
 	$$('#ov-range button', el).forEach((b) => (b.onclick = () => { store.set('ovRange', +b.dataset.k); overviewDaily(rows); }));
 	$$('#ov-metric button', el).forEach((b) => (b.onclick = () => { store.set('ovMetric', b.dataset.k); overviewDaily(rows); }));
 	const filled = fillDays(rows, range);
@@ -252,7 +252,7 @@ function overviewDaily(rows) {
 			return x ? (metric === 'cost' ? x.cost ?? 0 : x.total) : 0;
 		}),
 	}));
-	const chart = barChart($('canvas', el), {
+	const chart = barChart($('.chart', el), {
 		labels: filled.map((r, i) => periodLabel(r?.label ?? filled.keys[i])), series,
 		format: metric === 'cost' ? fmtUSD : fmtTok,
 		tooltipTitle: (i) => new Date(filled.keys[i] + 'T12:00').toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric' }),
@@ -301,10 +301,10 @@ function overviewTokens(rows) {
 
 function overviewMonthly(rows) {
 	const el = $('#monthly-card');
-	el.innerHTML = `<div class="card-head"><h2>Monthly cost by agent</h2><div class="spacer"></div><a class="btn small" href="#/r/monthly?by-agent=1">Open report</a></div><div id="mo-legend"></div><div class="chart-box short"><canvas></canvas></div>`;
+	el.innerHTML = `<div class="card-head"><h2>Monthly cost by agent</h2><div class="spacer"></div><a class="btn small" href="#/r/monthly?by-agent=1">Open report</a></div><div id="mo-legend"></div><div class="chart-box short"><div class="chart"></div></div>`;
 	const agents = agentSplit(rows).map(([a]) => a);
 	const series = agents.map((a) => ({ label: agentLabel(a), color: colorOf('agent', a), data: rows.map((r) => r.agents.find((x) => x.agent === a)?.cost ?? 0) }));
-	const chart = barChart($('canvas', el), { labels: rows.map((r) => periodLabel(r.label)), series });
+	const chart = barChart($('.chart', el), { labels: rows.map((r) => periodLabel(r.label)), series });
 	$('#mo-legend', el).replaceWith(legendHtml(series, chart));
 }
 
@@ -669,7 +669,7 @@ function renderPeriods(el, rows, cmd, key, flags) {
 				<div class="seg" id="metric">${[['cost', 'Cost'], ['tokens', 'Tokens']].map(([k, l]) => `<button data-k="${k}">${l}</button>`).join('')}</div>
 				<div class="seg" id="stack">${stackOpts.map(([k, l]) => `<button data-k="${k}">${l}</button>`).join('')}</div>
 			</div>
-			<div id="lg"></div><div class="chart-box tall"><canvas></canvas></div>
+			<div id="lg"></div><div class="chart-box tall"><div class="chart"></div></div>
 		</div>
 		<div class="card" style="margin-top:14px"><div class="card-head"><h2>Breakdown</h2><span class="hint">click a column to sort · ▸ expands ${hasAgents ? 'agents and ' : ''}models</span></div><div id="tbl"></div></div>`;
 
@@ -694,7 +694,7 @@ function renderPeriods(el, rows, cmd, key, flags) {
 		$$('#metric button', el).forEach((b) => { b.classList.toggle('on', b.dataset.k === m); b.disabled = stack === 'token'; });
 		$$('#stack button', el).forEach((b) => b.classList.toggle('on', b.dataset.k === stack));
 		$('#ch-title', el).textContent = `${m === 'cost' ? 'Cost' : 'Tokens'} per ${unit.replace(/s$/, '')}${stack !== 'none' ? ` by ${stack === 'token' ? 'token type' : stack}` : ''}${stack === 'model' && m === 'cost' && !modelCost ? ' (per-model cost not reported here, showing totals)' : ''}`;
-		const chart = barChart($('canvas', el), { labels: chrono.map((r) => periodLabel(r.label)), series, format: m === 'cost' ? fmtUSD : fmtTok, tooltipTitle: (i) => chrono[i].label });
+		const chart = barChart($('.chart', el), { labels: chrono.map((r) => periodLabel(r.label)), series, format: m === 'cost' ? fmtUSD : fmtTok, tooltipTitle: (i) => chrono[i].label });
 		const lg = series.length > 1 ? legendHtml(series, chart) : h('<div></div>');
 		lg.id = 'lg';
 		$('#lg', el).replaceWith(lg);
@@ -725,13 +725,13 @@ function renderSessions(el, rows, cmd) {
 	const showProject = rows.some((r) => r.project);
 	el.innerHTML = tilesHtml(rows, 'sessions') + `
 		<div class="grid cols-3">
-			<div class="card span-2"><div class="card-head"><h2>Top 15 sessions by cost</h2><span class="hint">click a bar to filter the table</span></div><div class="chart-box tall"><canvas></canvas></div></div>
+			<div class="card span-2"><div class="card-head"><h2>Top 15 sessions by cost</h2><span class="hint">click a bar to filter the table</span></div><div class="chart-box tall"><div class="chart"></div></div></div>
 			<div class="card"><div class="card-head"><h2>${showProject ? 'By project' : showAgent ? 'By agent' : 'By model'}</h2></div><div id="side"></div></div>
 		</div>
 		<div class="card" style="margin-top:14px"><div class="card-head"><h2>Sessions</h2><span class="hint" id="count"></span><div class="spacer"></div><input class="input" id="q" placeholder="Filter by id, project, model…" style="width:260px"></div><div id="tbl"></div></div>`;
 
 	const top = [...rows].sort((a, b) => (b.cost ?? 0) - (a.cost ?? 0)).slice(0, 15);
-	barChart($('canvas', el), {
+	barChart($('.chart', el), {
 		labels: top.map((r) => (showProject ? prettyProject(r.project) + ' · ' : '') + sessionLabel(r)),
 		series: [{ label: 'Cost', color: colorOf('agent', cmd.group === 'all' ? 'codex' : cmd.group), data: top.map((r) => r.cost ?? 0) }],
 		horizontal: true, stacked: false,
@@ -789,11 +789,11 @@ function renderInstances(el, rep) {
 
 	el.innerHTML = tilesHtml(rows, 'project-days') + `
 		<div class="grid cols-3">
-			<div class="card span-2"><div class="card-head"><h2>Daily cost by project</h2></div><div id="lg"></div><div class="chart-box tall"><canvas></canvas></div></div>
+			<div class="card span-2"><div class="card-head"><h2>Daily cost by project</h2></div><div id="lg"></div><div class="chart-box tall"><div class="chart"></div></div></div>
 			<div class="card"><div class="card-head"><h2>Projects</h2><span class="hint">${ranked.length} total</span></div>${barList(ranked.slice(0, 12).map((p) => ({ label: prettyProject(p.project), title: p.project, value: p.cost, color: colorOf('project', p.project), sub: `${p.rows.length}d` })))}</div>
 		</div>
 		<div class="card" style="margin-top:14px"><div class="card-head"><h2>Per project</h2><span class="hint">▸ expands days</span></div><div id="tbl"></div></div>`;
-	const chart = barChart($('canvas', el), { labels: dates.map(periodLabel), series });
+	const chart = barChart($('.chart', el), { labels: dates.map(periodLabel), series });
 	$('#lg', el).replaceWith(legendHtml(series, chart));
 	table($('#tbl', el), {
 		rows: ranked.map((p) => ({ ...p, label: p.project, models: [...new Map(p.rows.flatMap((r) => r.models).map((m) => [m.name, m])).values()] })),
@@ -830,21 +830,18 @@ function renderBlocks(el, rep, flags) {
 			<div class="card stat"><div class="label">Peak block</div><div class="value">${fmtUSD(peak?.costUSD)}</div><div class="meta">${fmtDate(peak?.startTime)} · ${fmtTok(peak?.totalTokens)}</div></div>
 		</div>
 		<div class="grid cols-3">
-			<div class="card span-2"><div class="card-head"><h2>Cost per block</h2><span class="hint">${active ? 'active block highlighted' : ''}${limit ? ` · token limit ${fmtTok(limit)}` : ''}</span></div><div class="chart-box tall"><canvas></canvas></div></div>
+			<div class="card span-2"><div class="card-head"><h2>Cost per block</h2><span class="hint">${active ? 'active block highlighted' : ''}${limit ? ` · token limit ${fmtTok(limit)}` : ''}</span></div><div class="chart-box tall"><div class="chart"></div></div></div>
 			<div class="card block-card">${activeBlockHtml(active, limit, false)}</div>
 		</div>
 		<div class="card" style="margin-top:14px"><div class="card-head"><h2>Blocks</h2></div><div id="tbl"></div></div>`;
 
-	const s1 = getComputedStyle(document.documentElement).getPropertyValue('--s1').trim();
-	const s2 = getComputedStyle(document.documentElement).getPropertyValue('--s2').trim();
-	const chart = barChart($('canvas', el), {
+	barChart($('.chart', el), {
 		labels: chrono.map((b) => fmtDate(b.startTime, { month: 'short', day: 'numeric', hour: '2-digit' })),
-		series: [{ label: 'Cost', color: s1, data: chrono.map((b) => b.costUSD ?? 0) }],
+		series: [{ label: 'Cost', color: 'var(--s1)', data: chrono.map((b) => b.costUSD ?? 0) }],
+		barColors: chrono.map((b) => (b.isActive ? 'var(--s2)' : 'var(--s1)')),
 		stacked: false,
 		tooltipTitle: (i) => `${fmtDate(chrono[i].startTime)} – ${fmtDate(chrono[i].actualEndTime ?? chrono[i].endTime, { hour: '2-digit', minute: '2-digit' })}${chrono[i].isActive ? ' (active)' : ''} · ${fmtTok(chrono[i].totalTokens)} tokens`,
 	});
-	chart.data.datasets[0].backgroundColor = chrono.map((b) => (b.isActive ? s2 : s1));
-	chart.update();
 
 	const rows = blocks.map((b) => ({
 		...b, label: b.startTime, cost: b.costUSD, total: b.totalTokens,

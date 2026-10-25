@@ -1,5 +1,3 @@
-/* global Chart */
-
 export const $ = (sel, root = document) => root.querySelector(sel);
 export const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
 
@@ -66,73 +64,165 @@ export const agentLabel = (a) => ({ claude: 'Claude Code', codex: 'Codex', all: 
 
 // ---------- charts ----------
 
-const charts = new WeakMap();
-
-function theme() {
-	return {
-		ink: cssVar('--ink'), ink2: cssVar('--ink-2'), muted: cssVar('--muted'),
-		grid: cssVar('--grid'), axis: cssVar('--axis'), surface: cssVar('--surface'), surface2: cssVar('--surface-2'),
-	};
+export function destroyCharts(root) {
+	for (const el of $$('.chart', root)) el._chart?.destroy();
 }
 
-export function destroyCharts(root) {
-	for (const c of $$('canvas', root)) charts.get(c)?.destroy();
+function niceStep(max, count = 5) {
+	const raw = max / count;
+	const mag = 10 ** Math.floor(Math.log10(raw));
+	const n = raw / mag;
+	return (n <= 1 ? 1 : n <= 2 ? 2 : n <= 2.5 ? 2.5 : n <= 5 ? 5 : 10) * mag;
+}
+
+const textWidth = (s) => String(s).length * 6.4;
+
+// Bar with only its far end rounded; (x, y) is the top-left corner.
+function barPath(x, y, w, hgt, r, horizontal) {
+	r = Math.max(0, Math.min(r, w / 2, hgt / 2));
+	if (horizontal) return `M${x},${y}H${x + w - r}Q${x + w},${y} ${x + w},${y + r}V${y + hgt - r}Q${x + w},${y + hgt} ${x + w - r},${y + hgt}H${x}Z`;
+	return `M${x},${y + hgt}V${y + r}Q${x},${y} ${x + r},${y}H${x + w - r}Q${x + w},${y} ${x + w},${y + r}V${y + hgt}Z`;
 }
 
 /**
+ * Inline-SVG bar chart. Canvas-free on purpose: GPU canvas bugs, fingerprinting
+ * protection and page-recoloring extensions can blank a <canvas> in some browsers.
  * series: [{ label, color, data: number[] }]
  */
-export function barChart(canvas, { labels, series, stacked = true, format = fmtUSD, horizontal = false, onClick, tooltipTitle }) {
-	charts.get(canvas)?.destroy();
-	const t = theme();
-	const valueAxis = {
-		stacked, beginAtZero: true,
-		grid: { color: t.grid, drawTicks: false },
-		border: { display: false },
-		ticks: { color: t.muted, padding: 8, callback: (v) => format(v), maxTicksLimit: 6, font: { size: 11 } },
-	};
-	const catAxis = {
-		stacked,
-		grid: { display: false },
-		border: { color: t.axis },
-		ticks: { color: t.muted, font: { size: 11 }, autoSkip: !horizontal, maxRotation: 0, autoSkipPadding: 12 },
-	};
-	const chart = new Chart(canvas, {
-		type: 'bar',
-		data: {
-			labels,
-			datasets: series.map((s, i) => ({
-				label: s.label, data: s.data, backgroundColor: s.color, hoverBackgroundColor: s.color,
-				borderColor: t.surface, borderWidth: stacked ? (horizontal ? { right: 2 } : { top: 2 }) : 0,
-				borderRadius: i === series.length - 1 || !stacked ? 4 : 0, borderSkipped: 'start',
-				maxBarThickness: horizontal ? 18 : 28, categoryPercentage: 0.8, barPercentage: 0.9,
-			})),
+export function barChart(host, { labels, series, stacked = true, format = fmtUSD, horizontal = false, onClick, tooltipTitle, barColors }) {
+	host._chart?.destroy();
+	const hidden = new Set();
+	const tip = h('<div class="chart-tip" hidden></div>');
+	let geo = null;
+
+	const visible = () => series.map((_, i) => i).filter((i) => !hidden.has(i));
+	const valueAt = (i, si) => Math.max(0, Number(series[si].data[i]) || 0);
+
+	function draw() {
+		const W = host.clientWidth, H = host.clientHeight;
+		if (!W || !H) return;
+		const vis = visible();
+		const n = labels.length;
+		const totals = labels.map((_, i) => (stacked ? vis.reduce((s, si) => s + valueAt(i, si), 0) : Math.max(0, ...vis.map((si) => valueAt(i, si)))));
+		const step = niceStep(Math.max(...totals, 0) || 1);
+		const top = Math.ceil((Math.max(...totals, 0) || 1) / step) * step;
+		const ticks = [];
+		for (let v = 0; v <= top + step / 2; v += step) ticks.push(v);
+		const pad = horizontal
+			? { t: 4, r: 12, b: 22, l: Math.min(240, Math.max(0, ...labels.map(textWidth)) + 12) }
+			: { t: 8, r: 8, b: 24, l: Math.max(...ticks.map((v) => textWidth(format(v)))) + 12 };
+		const pw = Math.max(10, W - pad.l - pad.r), ph = Math.max(10, H - pad.t - pad.b);
+		const band = (horizontal ? ph : pw) / Math.max(n, 1);
+		const groups = stacked ? 1 : Math.max(vis.length, 1);
+		const thick = Math.min(horizontal ? 18 : 28, band * 0.78);
+		const scale = (v) => (v / top) * (horizontal ? pw : ph);
+		const out = [];
+
+		for (const v of ticks) {
+			if (horizontal) {
+				const x = pad.l + scale(v);
+				out.push(`<line x1="${x}" x2="${x}" y1="${pad.t}" y2="${pad.t + ph}" style="stroke:var(--grid)"/>`);
+				out.push(`<text x="${x}" y="${H - 6}" text-anchor="middle" class="ct">${esc(format(v))}</text>`);
+			} else {
+				const y = pad.t + ph - scale(v);
+				out.push(`<line x1="${pad.l}" x2="${pad.l + pw}" y1="${y}" y2="${y}" style="stroke:var(--grid)"/>`);
+				out.push(`<text x="${pad.l - 8}" y="${y + 4}" text-anchor="end" class="ct">${esc(format(v))}</text>`);
+			}
+		}
+		out.push(`<rect class="hl" x="0" y="0" width="0" height="0" rx="6" style="fill:var(--surface-2)" />`);
+
+		const every = horizontal ? Math.max(1, Math.ceil(14 / band)) : Math.max(1, Math.ceil((Math.max(0, ...labels.map(textWidth)) + 14) / band));
+		labels.forEach((l, i) => {
+			if (i % every) return;
+			const c = (horizontal ? pad.t : pad.l) + band * i + band / 2;
+			const s = horizontal && textWidth(l) > pad.l - 12 ? String(l).slice(0, Math.floor((pad.l - 12) / 6.4) - 1) + '…' : l;
+			out.push(horizontal
+				? `<text x="${pad.l - 8}" y="${c + 4}" text-anchor="end" class="ct">${esc(s)}</text>`
+				: `<text x="${c}" y="${H - 6}" text-anchor="middle" class="ct">${esc(s)}</text>`);
+		});
+
+		labels.forEach((_, i) => {
+			const c = (horizontal ? pad.t : pad.l) + band * i + band / 2;
+			const segs = vis.filter((si) => valueAt(i, si) > 0);
+			let acc = 0;
+			segs.forEach((si, k) => {
+				const len = scale(valueAt(i, si));
+				const gap = stacked && k > 0 ? 2 : 0;
+				const w = thick / groups;
+				const offset = stacked ? 0 : (vis.indexOf(si) - (groups - 1) / 2) * w;
+				const from = (stacked ? acc : 0) + gap;
+				const size = Math.max(0.5, len - gap);
+				const r = !stacked || k === segs.length - 1 ? 4 : 0;
+				const fill = barColors?.[i] ?? series[si].color;
+				const d = horizontal
+					? barPath(pad.l + from, c - w / 2 + offset, size, w, r, true)
+					: barPath(c - w / 2 + offset, pad.t + ph - from - size, w, size, r, false);
+				out.push(`<path d="${d}" style="fill:${fill}"/>`);
+				acc += len;
+			});
+		});
+		out.push(horizontal
+			? `<line x1="${pad.l}" x2="${pad.l}" y1="${pad.t}" y2="${pad.t + ph}" style="stroke:var(--axis)"/>`
+			: `<line x1="${pad.l}" x2="${pad.l + pw}" y1="${pad.t + ph}" y2="${pad.t + ph}" style="stroke:var(--axis)"/>`);
+
+		host.innerHTML = `<svg width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" role="img">${out.join('')}</svg>`;
+		host.append(tip);
+		geo = { pad, pw, ph, band, n, W, H };
+		if (onClick) host.style.cursor = 'pointer';
+	}
+
+	function indexAt(e) {
+		if (!geo) return -1;
+		const r = host.getBoundingClientRect();
+		const pos = horizontal ? e.clientY - r.top - geo.pad.t : e.clientX - r.left - geo.pad.l;
+		const i = Math.floor(pos / geo.band);
+		return i >= 0 && i < geo.n ? i : -1;
+	}
+
+	function onMove(e) {
+		const i = indexAt(e);
+		const hl = host.querySelector('.hl');
+		if (i < 0) { tip.hidden = true; hl?.setAttribute('width', 0); return; }
+		const { pad, pw, ph, band } = geo;
+		if (hl) {
+			if (horizontal) Object.entries({ x: pad.l, y: pad.t + band * i, width: pw, height: band }).forEach(([k, v]) => hl.setAttribute(k, v));
+			else Object.entries({ x: pad.l + band * i, y: pad.t, width: band, height: ph }).forEach(([k, v]) => hl.setAttribute(k, v));
+		}
+		const rows = visible().map((si) => [si, valueAt(i, si)]).filter(([, v]) => v > 0).sort((a, b) => b[1] - a[1]);
+		const total = rows.reduce((s, [, v]) => s + v, 0);
+		tip.innerHTML = `<div class="tt-title">${esc(tooltipTitle ? tooltipTitle(i) : labels[i])}</div>` +
+			(rows.length ? rows.map(([si, v]) => `<div class="tt-row"><i class="swatch" style="background:${barColors?.[i] ?? series[si].color}"></i><span>${esc(series[si].label)}</span><b>${esc(format(v))}</b></div>`).join('') : '<div class="tt-row"><span>No usage</span></div>') +
+			(rows.length > 1 ? `<div class="tt-row tt-total"><span>Total</span><b>${esc(format(total))}</b></div>` : '');
+		tip.hidden = false;
+		const r = host.getBoundingClientRect();
+		const x = e.clientX - r.left, y = e.clientY - r.top;
+		const tw = tip.offsetWidth, th = tip.offsetHeight;
+		tip.style.left = `${x + 14 + tw > r.width ? Math.max(0, x - 14 - tw) : x + 14}px`;
+		tip.style.top = `${Math.max(0, Math.min(r.height - th, y - th / 2))}px`;
+	}
+
+	const onLeave = () => { tip.hidden = true; host.querySelector('.hl')?.setAttribute('width', 0); };
+	const onClickHandler = (e) => { const i = indexAt(e); if (i >= 0) onClick(i); };
+	host.addEventListener('mousemove', onMove);
+	host.addEventListener('mouseleave', onLeave);
+	if (onClick) host.addEventListener('click', onClickHandler);
+	const ro = new ResizeObserver(() => draw());
+	ro.observe(host);
+	draw();
+
+	const chart = {
+		isDatasetVisible: (i) => !hidden.has(i),
+		setDatasetVisibility: (i, v) => (v ? hidden.delete(i) : hidden.add(i)),
+		update: draw,
+		destroy() {
+			ro.disconnect();
+			host.removeEventListener('mousemove', onMove);
+			host.removeEventListener('mouseleave', onLeave);
+			host.removeEventListener('click', onClickHandler);
+			host._chart = null;
 		},
-		options: {
-			indexAxis: horizontal ? 'y' : 'x',
-			responsive: true, maintainAspectRatio: false, animation: { duration: 250 },
-			interaction: { mode: 'index', intersect: false, axis: horizontal ? 'y' : 'x' },
-			onClick: onClick ? (e, els) => els[0] && onClick(els[0].index) : undefined,
-			onHover: onClick ? (e, els) => (e.native.target.style.cursor = els.length ? 'pointer' : 'default') : undefined,
-			scales: horizontal ? { x: valueAxis, y: catAxis } : { x: catAxis, y: valueAxis },
-			plugins: {
-				legend: { display: false },
-				tooltip: {
-					backgroundColor: t.surface, titleColor: t.ink, bodyColor: t.ink2, borderColor: t.grid, borderWidth: 1,
-					padding: 10, boxPadding: 4, usePointStyle: true, cornerRadius: 8,
-					filter: (item) => item.raw > 0,
-					itemSort: (a, b) => b.raw - a.raw,
-					callbacks: {
-						title: tooltipTitle ? (items) => tooltipTitle(items[0].dataIndex) : undefined,
-						label: (c) => ` ${c.dataset.label}: ${format(c.raw)}`,
-						footer: (items) => (items.length > 1 ? `Total: ${format(items.reduce((s, i) => s + i.raw, 0))}` : ''),
-					},
-					footerColor: t.ink,
-				},
-			},
-		},
-	});
-	charts.set(canvas, chart);
+	};
+	host._chart = chart;
 	return chart;
 }
 
