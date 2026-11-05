@@ -1,8 +1,8 @@
 import { ansiToHtml } from './ansi.js';
 import { normalizeReport, prettyProject, sessionLabel, sumRows, toCSV, TOKEN_TYPES } from './data.js';
 import {
-	$, $$, agentLabel, barChart, barList, colorOf, copy, destroyCharts, download, esc, fmtDate, fmtDuration,
-	fmtInt, fmtPct, fmtTok, fmtUSD, h, ICONS, legendHtml, registerModels, shortModel, slotOf,
+	$, $$, agentLabel, barChart, barList, calendarHeatmap, colorOf, copy, destroyCharts, download, esc, fmtDate, fmtDuration,
+	fmtInt, fmtPct, fmtTok, fmtUSD, h, hourHeatmap, ICONS, legendHtml, registerModels, shortModel, slotOf, weekHourLabel,
 } from './ui.js';
 
 const SERVER_FLAGS = new Set(['help', 'version', 'color', 'no-color', 'json']);
@@ -12,7 +12,7 @@ const store = {
 	set: (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} },
 };
 
-const state = { catalog: null, timer: null, renderId: 0 };
+const state = { catalog: null, timer: null, renderId: 0, hours: null };
 
 // Model colors are scoped per agent group so one agent's models don't exhaust another's slots.
 let modelKind = 'model';
@@ -35,6 +35,7 @@ async function runReport(command, flags = {}, { fresh = false } = {}) {
 
 const findCmd = (path) => state.catalog.commands.find((c) => c.path.join(' ') === path.join(' '));
 const hasFlag = (cmd, name) => cmd.flags.some((f) => f.name === name);
+const hasExactBlocks = (cmd) => cmd.path.join(' ') === 'claude blocks';
 
 // ---------- formatting helpers ----------
 
@@ -132,6 +133,8 @@ function buildSidebar() {
 
 // ---------- overview ----------
 
+const READING_TRANSCRIPTS = '<div class="center"><span class="spinner"></span>Reading Claude transcripts…</div>';
+
 async function renderOverview(id) {
 	const auto = store.get('autoRefresh', true);
 	main().innerHTML = `
@@ -144,8 +147,10 @@ async function renderOverview(id) {
 		<div class="grid cols-4" id="tiles"><div class="card span-all center"><span class="spinner"></span>Loading usage…</div></div>
 		<div class="grid cols-3" style="margin-top:14px">
 			<div class="card span-2" id="daily-card"></div>
-			<div class="card block-card" id="block-card"></div>
+			<div class="card block-card" id="block-card">${READING_TRANSCRIPTS}</div>
 		</div>
+		<div class="grid" style="margin-top:14px"><div class="card" id="heat-card"></div></div>
+		<div class="grid" style="margin-top:14px"><div class="card" id="hours-card">${READING_TRANSCRIPTS}</div></div>
 		<div class="grid cols-3" style="margin-top:14px">
 			<div class="card" id="agents-card"></div>
 			<div class="card" id="models-card"></div>
@@ -161,10 +166,11 @@ async function renderOverview(id) {
 	if (auto) state.timer = setInterval(() => document.visibilityState === 'visible' && load(false), 60_000);
 
 	async function load(fresh) {
-		const [daily, monthly, block, sessions, claudeSessions] = await Promise.allSettled([
+		// Awaited after the rest so a slow first transcript read doesn't hold back the other cards.
+		const activityResult = api('/api/claude/activity', { fresh }).then((value) => ({ value }), (reason) => ({ reason }));
+		const [daily, monthly, sessions, claudeSessions] = await Promise.allSettled([
 			runReport(['daily'], { 'by-agent': true }, { fresh }),
 			runReport(['monthly'], { 'by-agent': true }, { fresh }),
-			runReport(['claude', 'blocks'], { active: true }, { fresh }),
 			runReport(['session'], {}, { fresh }),
 			runReport(['claude', 'session'], {}, { fresh }),
 		]);
@@ -179,14 +185,22 @@ async function renderOverview(id) {
 			registerModels(mt);
 			overviewTiles(rows);
 			overviewDaily(rows);
+			overviewHeatmap(rows);
 			overviewAgents(rows);
 			overviewModels(mt);
 			overviewTokens(rows);
-		} else ['#tiles', '#daily-card', '#agents-card', '#models-card', '#tokens-card'].forEach((s) => fail(s, daily));
+		} else ['#tiles', '#daily-card', '#heat-card', '#agents-card', '#models-card', '#tokens-card'].forEach((s) => fail(s, daily));
 		if (monthly.status === 'fulfilled') overviewMonthly(normalizeReport(monthly.value.data).sections[0].rows); else fail('#monthly-card', monthly);
-		if (block.status === 'fulfilled') $('#block-card').innerHTML = activeBlockHtml(block.value.data.blocks?.find((b) => b.isActive), null, true); else fail('#block-card', block);
 		if (sessions.status === 'fulfilled') overviewSessions(normalizeReport(sessions.value.data).sections[0].rows); else fail('#sessions-card', sessions);
 		if (claudeSessions.status === 'fulfilled') overviewProjects(normalizeReport(claudeSessions.value.data).sections[0].rows); else fail('#projects-card', claudeSessions);
+
+		const activity = await activityResult;
+		if (id !== state.renderId) return;
+		if (activity.value) {
+			$('#block-card').innerHTML = activeBlockHtml(activity.value.data.blocks.find((b) => b.isActive), null, true);
+			state.hours = activity.value.hours;
+			overviewHours();
+		} else ['#block-card', '#hours-card'].forEach((s) => fail(s, activity));
 	}
 	await load(false);
 }
@@ -242,7 +256,7 @@ function overviewDaily(rows) {
 		<div id="ov-legend"></div>
 		<div class="chart-box"><div class="chart"></div></div>`;
 	$$('#ov-range button', el).forEach((b) => (b.onclick = () => { store.set('ovRange', +b.dataset.k); overviewDaily(rows); }));
-	$$('#ov-metric button', el).forEach((b) => (b.onclick = () => { store.set('ovMetric', b.dataset.k); overviewDaily(rows); }));
+	$$('#ov-metric button', el).forEach((b) => (b.onclick = () => { store.set('ovMetric', b.dataset.k); overviewDaily(rows); overviewHeatmap(rows); overviewHours(); }));
 	const filled = fillDays(rows, range);
 	const agents = agentSplit(rows).map(([a]) => a);
 	const series = agents.map((a) => ({
@@ -275,6 +289,76 @@ function fillDays(rows, range) {
 	}
 	out.keys = keys;
 	return out;
+}
+
+const overviewHeatmap = (rows) => dailyHeatmap($('#heat-card'), rows, store.get('ovMetric', 'cost'));
+
+// Shows the trailing year unless a date flag narrowed the report; rows must be chronological.
+function dailyHeatmap(card, rows, metric, { path = ['daily'], color, flags = {} } = {}) {
+	destroyCharts(card);
+	const val = (x) => (metric === 'cost' ? x.cost ?? 0 : x.total);
+	const format = metric === 'cost' ? fmtUSD : fmtTok;
+	const by = new Map(rows.map((r) => [r.label, r]));
+	const narrowed = ['since', 'until', 'last'].some((f) => flags[f]);
+	const newest = rows.at(-1)?.label ?? todayKey();
+	const end = narrowed || newest > todayKey() ? newest : todayKey();
+	const start = narrowed ? rows[0].label : new Date(new Date(end + 'T12:00').getTime() - 52 * 7 * 864e5).toLocaleDateString('en-CA');
+	const shown = rows.filter((r) => r.label >= start);
+	const peak = shown.length ? shown.reduce((m, r) => (val(r) > val(m) ? r : m)) : null;
+	const title = `Daily ${metric === 'cost' ? 'cost' : 'tokens'} heatmap`;
+	card.innerHTML = `<div class="card-head"><h2>${title}</h2>${peak ? `<span class="hint">peak ${esc(format(val(peak)))} on ${esc(periodLabel(peak.label))} · click a day to open it</span>` : ''}</div><div class="chart heat"></div>`;
+	calendarHeatmap($('.chart', card), {
+		start, end, format, color, label: title,
+		values: new Map(rows.map((r) => [r.label, val(r)])),
+		detail: (k) => {
+			const r = by.get(k);
+			const parts = r.agents.length
+				? r.agents.map((a) => ({ label: agentLabel(a.agent), color: colorOf('agent', a.agent), value: val(a) }))
+				: r.models.map((m) => ({ label: shortModel(m.name), color: mColor(m.name), value: val(m) }));
+			const known = parts.filter((p) => p.value > 0).sort((a, b) => b.value - a.value);
+			return known.length ? known : [{ label: 'Total', color: 'var(--heat)', value: val(r) }];
+		},
+		onClick: (k) => {
+			const p = parseHash().params;
+			p.delete('last');
+			p.set('since', isoToYmd(k));
+			p.set('until', isoToYmd(k));
+			setHash('r', path, p, false);
+		},
+	});
+}
+
+function overviewHours() {
+	const el = $('#hours-card');
+	if (!el || !state.hours) return;
+	destroyCharts(el);
+	const range = store.get('hoursRange', 30);
+	const metric = store.get('ovMetric', 'cost');
+	const format = metric === 'cost' ? fmtUSD : fmtTok;
+	const from = range ? Date.now() - range * 864e5 : 0;
+	const byModel = new Map();
+	for (const { t, models } of state.hours) {
+		if (t < from) continue;
+		const d = new Date(t);
+		const key = `${(d.getDay() + 6) % 7}:${d.getHours()}`;
+		const cell = byModel.get(key) ?? {};
+		for (const [name, [cost, tokens]] of Object.entries(models)) cell[name] = (cell[name] ?? 0) + (metric === 'cost' ? cost : tokens);
+		byModel.set(key, cell);
+	}
+	const values = new Map([...byModel].map(([k, cell]) => [k, Object.values(cell).reduce((s, v) => s + v, 0)]));
+	const peak = [...values].reduce((m, e) => (e[1] > (m?.[1] ?? 0) ? e : m), null);
+	const peakText = peak ? `busiest ${weekHourLabel(...peak[0].split(':').map(Number))} · ` : '';
+	el.innerHTML = `<div class="card-head"><h2>Claude Code ${metric === 'cost' ? 'cost' : 'tokens'} by hour</h2><span class="hint">${esc(peakText)}your local time</span><div class="spacer"></div>
+			<div class="seg" id="hours-range">${[[7, '7D'], [30, '30D'], [90, '90D'], [0, 'All']].map(([k, l]) => `<button data-k="${k}" class="${range === k ? 'on' : ''}">${l}</button>`).join('')}</div>
+		</div><div class="chart heat"></div>`;
+	$$('#hours-range button', el).forEach((b) => (b.onclick = () => { store.set('hoursRange', +b.dataset.k); overviewHours(); }));
+	hourHeatmap($('.chart', el), {
+		values, format, color: colorOf('agent', 'claude'), label: 'Claude Code usage by weekday and hour',
+		detail: (k) => Object.entries(byModel.get(k))
+			.filter(([, v]) => v > 0)
+			.sort((a, b) => b[1] - a[1])
+			.map(([name, value]) => ({ label: shortModel(name), color: mColor(name), value })),
+	});
 }
 
 function overviewAgents(rows) {
@@ -359,7 +443,7 @@ function activeBlockHtml(b, limit, withLink) {
 			<span class="pill live">Active</span>${status}
 		</div>
 		<div class="progress" title="${fmtPct(elapsed)} of the block elapsed"><b style="left:0;width:${elapsed * 100}%"></b><i style="width:${Math.min(1, (b.costUSD / (proj?.totalCost || b.costUSD || 1))) * elapsed * 100}%"></i></div>
-		<div style="display:flex;justify-content:space-between;color:var(--muted);font-size:12px"><span>${fmtDate(b.startTime, { hour: '2-digit', minute: '2-digit' })}</span><span>${proj ? fmtDuration(proj.remainingMinutes) + ' left' : ''}</span><span>${fmtDate(b.endTime, { hour: '2-digit', minute: '2-digit' })}</span></div>
+		<div style="display:flex;justify-content:space-between;gap:8px;color:var(--muted);font-size:12px"><span>Started ${fmtDate(b.startTime, { hour: '2-digit', minute: '2-digit' })}</span><span>${fmtDuration(Math.round((end - now) / 6e4))} left</span><span>Resets ${fmtDate(b.endTime, { hour: '2-digit', minute: '2-digit' })}</span></div>
 		${limit ? `<div style="margin-top:12px"><div style="display:flex;justify-content:space-between;font-size:12.5px;color:var(--ink-2)"><span>Token limit ${fmtTok(limit)}</span><span>${fmtPct(usedPct)} used · ${fmtPct(limitPct)} projected</span></div>
 			<div class="progress"><b style="left:0;width:${Math.min(100, limitPct * 100)}%;background:color-mix(in srgb, ${limitPct > 1 ? 'var(--crit)' : 'var(--s1)'} 30%, transparent)"></b><i style="width:${Math.min(100, usedPct * 100)}%;background:${limitPct > 1 ? 'var(--crit)' : 'var(--s1)'}"></i></div></div>` : ''}
 		<dl class="kv">
@@ -539,7 +623,8 @@ async function renderExplorer(path, params, id) {
 		out.innerHTML = `<div class="card center"><span class="spinner"></span>Running ccusage…</div>`;
 		const flags = flagsFromParams(cmd, params2);
 		try {
-			const r = await api('/api/run', { command: cmd.path, flags, json: view !== 'terminal', fresh });
+			const useExactBlocks = view === 'visual' && hasExactBlocks(cmd);
+			const r = await api(useExactBlocks ? '/api/claude/activity' : '/api/run', { command: cmd.path, flags, json: view !== 'terminal', fresh });
 			if (my !== seq || id !== state.renderId) return;
 			const meta = `<div class="toolbar" style="margin-bottom:10px;color:var(--muted);font-size:12.5px"><span>exit ${r.code} · ${r.ms} ms${r.cached ? ' · cached' : ''}</span><div class="spacer" style="flex:1"></div>
 				${view !== 'terminal' && r.data ? `<button class="btn small" id="dl-json">${ICONS.download}JSON</button>` : ''}
@@ -620,7 +705,7 @@ function buildOptions(cmd, params, onChange) {
 function renderVisual(el, json, cmd, flags) {
 	const rep = normalizeReport(json);
 	if (!rep) { el.innerHTML = '<div class="empty">Nothing to show</div>'; return; }
-	if (rep.kind === 'blocks') return renderBlocks(el, rep, flags);
+	if (rep.kind === 'blocks') return renderBlocks(el, rep, flags, hasExactBlocks(cmd));
 	if (rep.kind === 'instances') return renderInstances(el, rep);
 	if (!rep.sections.length || rep.sections.every((s) => !s.rows.length)) {
 		el.innerHTML = `<div class="card empty">No usage found for this report and filter.</div>`;
@@ -658,6 +743,8 @@ function renderPeriods(el, rows, cmd, key, flags) {
 	let stack = store.get(`stack:${cmd.group}`, stackOpts[0][0]);
 	if (!stackOpts.some(([k]) => k === stack)) stack = stackOpts[0][0];
 	let metric = rows.every((r) => r.cost == null) ? 'tokens' : store.get('metric', 'cost');
+	// A one-day report (what clicking a heatmap cell opens) has nothing to map.
+	const showHeat = key === 'daily' && chrono.length >= 7 && chrono.every((r) => /^\d{4}-\d{2}-\d{2}$/.test(r.label));
 
 	const mt = new Map();
 	for (const r of chrono) for (const m of r.models) mt.set(m.name, (mt.get(m.name) ?? 0) + (m.cost ?? m.total));
@@ -671,6 +758,7 @@ function renderPeriods(el, rows, cmd, key, flags) {
 			</div>
 			<div id="lg"></div><div class="chart-box tall"><div class="chart"></div></div>
 		</div>
+		${showHeat ? '<div class="card" id="heat" style="margin-top:14px"></div>' : ''}
 		<div class="card" style="margin-top:14px"><div class="card-head"><h2>Breakdown</h2><span class="hint">click a column to sort · ▸ expands ${hasAgents ? 'agents and ' : ''}models</span></div><div id="tbl"></div></div>`;
 
 	function drawChart() {
@@ -698,6 +786,7 @@ function renderPeriods(el, rows, cmd, key, flags) {
 		const lg = series.length > 1 ? legendHtml(series, chart) : h('<div></div>');
 		lg.id = 'lg';
 		$('#lg', el).replaceWith(lg);
+		if (showHeat) dailyHeatmap($('#heat', el), chrono, m, { path: cmd.path, color: cmd.group === 'all' ? undefined : colorOf('agent', cmd.group), flags });
 	}
 	$$('#metric button', el).forEach((b) => (b.onclick = () => { metric = b.dataset.k; store.set('metric', metric); drawChart(); }));
 	$$('#stack button', el).forEach((b) => (b.onclick = () => { stack = b.dataset.k; store.set(`stack:${cmd.group}`, stack); drawChart(); }));
@@ -809,7 +898,7 @@ function renderInstances(el, rep) {
 	});
 }
 
-function renderBlocks(el, rep, flags) {
+function renderBlocks(el, rep, flags, exact) {
 	const blocks = rep.blocks;
 	const real = blocks.filter((b) => !b.isGap);
 	if (!real.length) { el.innerHTML = `<div class="card empty">No blocks found for this filter.</div>`; return; }
@@ -833,10 +922,10 @@ function renderBlocks(el, rep, flags) {
 			<div class="card span-2"><div class="card-head"><h2>Cost per block</h2><span class="hint">${active ? 'active block highlighted' : ''}${limit ? ` · token limit ${fmtTok(limit)}` : ''}</span></div><div class="chart-box tall"><div class="chart"></div></div></div>
 			<div class="card block-card">${activeBlockHtml(active, limit, false)}</div>
 		</div>
-		<div class="card" style="margin-top:14px"><div class="card-head"><h2>Blocks</h2></div><div id="tbl"></div></div>`;
+		<div class="card" style="margin-top:14px"><div class="card-head"><h2>Blocks</h2>${exact ? '<span class="hint">Start is your first message. Resets are 5 hours later, snapped down to 10 minutes like Claude\'s limit clock. The Terminal and JSON views show ccusage\'s hour-rounded blocks.</span>' : ''}</div><div id="tbl"></div></div>`;
 
 	barChart($('.chart', el), {
-		labels: chrono.map((b) => fmtDate(b.startTime, { month: 'short', day: 'numeric', hour: '2-digit' })),
+		labels: chrono.map((b) => fmtDate(b.startTime)),
 		series: [{ label: 'Cost', color: 'var(--s1)', data: chrono.map((b) => b.costUSD ?? 0) }],
 		barColors: chrono.map((b) => (b.isActive ? 'var(--s2)' : 'var(--s1)')),
 		stacked: false,
@@ -853,6 +942,7 @@ function renderBlocks(el, rep, flags) {
 		rows,
 		columns: [
 			{ key: 'label', label: 'Start', fmt: (r) => fmtDate(r.startTime, { year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) },
+			{ key: 'endTime', label: 'Resets', fmt: (r) => (r.isGap ? '' : fmtDate(r.endTime)) },
 			{ key: 'status', label: 'Status', fmt: (r) => (r.isActive ? '<span class="pill live">Active</span>' : r.isGap ? '<span class="pill">Gap</span>' : '<span class="pill">Done</span>'), sort: (r) => (r.isActive ? 2 : r.isGap ? 0 : 1) },
 			{ key: 'duration', label: 'Duration', num: true, fmt: (r) => fmtDuration(r.duration) },
 			{ key: 'models', label: 'Models', fmt: (r) => (r.isGap ? '' : modelTags(r.models)), sort: (r) => r.models.length },

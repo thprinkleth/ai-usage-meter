@@ -7,6 +7,7 @@ import { createRequire } from 'node:module';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { createClaudeUsage, selectBlocks } from './claude-usage.js';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const require = createRequire(import.meta.url);
@@ -181,6 +182,24 @@ async function listTranscripts(limit = 60) {
 	return out.sort((a, b) => b.mtime - a.mtime).slice(0, limit);
 }
 
+const claudeUsage = createClaudeUsage(claudeRoots);
+
+// Filters the blocks; never forwarded to the hourly pricing run, which must cover the full history.
+const BLOCK_FILTER_FLAGS = new Set(['since', 'until', 'active', 'recent', 'order', 'token-limit', 'session-length']);
+
+async function claudeActivity({ flags = {}, fresh }) {
+	const started = Date.now();
+	const cmd = findCommand(['claude', 'blocks']);
+	if (!cmd) throw new Error('This ccusage version has no "claude blocks" report');
+	await claudeUsage.scan();
+	const pricing = Object.fromEntries(Object.entries(flags).filter(([k]) => !BLOCK_FILTER_FLAGS.has(k)));
+	const r = await cachedRun([...buildArgs(cmd, { ...pricing, 'session-length': '1' }), '--json'], { color: false }, fresh);
+	if (r.code !== 0) throw new Error((r.stderr || r.stdout || `ccusage exited with ${r.code}`).trim());
+	const windowHours = Number(flags['session-length']) > 0 ? Number(flags['session-length']) : 5;
+	const { blocks, hours } = claudeUsage.activity(JSON.parse(r.stdout).blocks ?? [], { windowHours });
+	return { code: 0, stdout: '', stderr: r.stderr, ms: Date.now() - started, data: { blocks: selectBlocks(blocks, flags) }, hours };
+}
+
 // ---------- HTTP ----------
 
 const cache = new Map();
@@ -227,6 +246,8 @@ const server = createServer(async (req, res) => {
 			if (!/application\/json/.test(req.headers['content-type'] || '')) return send(res, 415, { error: 'JSON required' });
 			const body = await readBody(req);
 			if (!catalog) await buildCatalog();
+
+			if (url.pathname === '/api/claude/activity') return send(res, 200, await claudeActivity(body));
 
 			if (url.pathname === '/api/run') {
 				const cmd = findCommand(body.command || []);
@@ -290,6 +311,8 @@ function listen(port, attemptsLeft) {
 		const url = `http://${HOST === '0.0.0.0' ? 'localhost' : HOST}:${port}`;
 		console.log(`AI Usage Meter → ${url}  (ccusage ${catalog.version}, ${catalog.commands.length} commands)`);
 		if (process.argv.includes('--open') || (process.env.OPEN && process.env.OPEN !== '0')) openBrowser(url);
+		// The first full read can take seconds; start now so the first page load doesn't wait for all of it.
+		claudeUsage.scan().catch(() => {});
 	});
 }
 

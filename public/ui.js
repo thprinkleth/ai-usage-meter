@@ -84,6 +84,21 @@ function barPath(x, y, w, hgt, r, horizontal) {
 	return `M${x},${y + hgt}V${y + r}Q${x},${y} ${x + r},${y}H${x + w - r}Q${x + w},${y} ${x + w},${y + r}V${y + hgt}Z`;
 }
 
+function tipHtml(title, rows, format) {
+	const total = rows.reduce((s, r) => s + r.value, 0);
+	return `<div class="tt-title">${esc(title)}</div>` +
+		(rows.length ? rows.map((r) => `<div class="tt-row"><i class="swatch" style="background:${r.color}"></i><span>${esc(r.label)}</span><b>${esc(format(r.value))}</b></div>`).join('') : '<div class="tt-row"><span>No usage</span></div>') +
+		(rows.length > 1 ? `<div class="tt-row tt-total"><span>Total</span><b>${esc(format(total))}</b></div>` : '');
+}
+
+function placeTip(tip, host, e) {
+	const r = host.getBoundingClientRect();
+	const x = e.clientX - r.left, y = e.clientY - r.top;
+	const tw = tip.offsetWidth, th = tip.offsetHeight;
+	tip.style.left = `${x + 14 + tw > r.width ? Math.max(0, x - 14 - tw) : x + 14}px`;
+	tip.style.top = `${Math.max(0, Math.min(r.height - th, y - th / 2))}px`;
+}
+
 /**
  * Inline-SVG bar chart. Canvas-free on purpose: GPU canvas bugs, fingerprinting
  * protection and page-recoloring extensions can blank a <canvas> in some browsers.
@@ -188,17 +203,10 @@ export function barChart(host, { labels, series, stacked = true, format = fmtUSD
 			if (horizontal) Object.entries({ x: pad.l, y: pad.t + band * i, width: pw, height: band }).forEach(([k, v]) => hl.setAttribute(k, v));
 			else Object.entries({ x: pad.l + band * i, y: pad.t, width: band, height: ph }).forEach(([k, v]) => hl.setAttribute(k, v));
 		}
-		const rows = visible().map((si) => [si, valueAt(i, si)]).filter(([, v]) => v > 0).sort((a, b) => b[1] - a[1]);
-		const total = rows.reduce((s, [, v]) => s + v, 0);
-		tip.innerHTML = `<div class="tt-title">${esc(tooltipTitle ? tooltipTitle(i) : labels[i])}</div>` +
-			(rows.length ? rows.map(([si, v]) => `<div class="tt-row"><i class="swatch" style="background:${barColors?.[i] ?? series[si].color}"></i><span>${esc(series[si].label)}</span><b>${esc(format(v))}</b></div>`).join('') : '<div class="tt-row"><span>No usage</span></div>') +
-			(rows.length > 1 ? `<div class="tt-row tt-total"><span>Total</span><b>${esc(format(total))}</b></div>` : '');
+		const rows = visible().map((si) => ({ label: series[si].label, color: barColors?.[i] ?? series[si].color, value: valueAt(i, si) })).filter((r) => r.value > 0).sort((a, b) => b.value - a.value);
+		tip.innerHTML = tipHtml(tooltipTitle ? tooltipTitle(i) : labels[i], rows, format);
 		tip.hidden = false;
-		const r = host.getBoundingClientRect();
-		const x = e.clientX - r.left, y = e.clientY - r.top;
-		const tw = tip.offsetWidth, th = tip.offsetHeight;
-		tip.style.left = `${x + 14 + tw > r.width ? Math.max(0, x - 14 - tw) : x + 14}px`;
-		tip.style.top = `${Math.max(0, Math.min(r.height - th, y - th / 2))}px`;
+		placeTip(tip, host, e);
 	}
 
 	const onLeave = () => { tip.hidden = true; host.querySelector('.hl')?.setAttribute('width', 0); };
@@ -224,6 +232,174 @@ export function barChart(host, { labels, series, stacked = true, format = fmtUSD
 	};
 	host._chart = chart;
 	return chart;
+}
+
+const dayKey = (d) => d.toLocaleDateString('en-CA');
+const addDays = (d, n) => { const x = new Date(d); x.setDate(x.getDate() + n); return x; };
+
+// Daily usage is heavy-tailed, so buckets are quantiles of active days: on a linear
+// scale one huge day would wash every other day out to the palest step.
+function heatScale(values, format) {
+	const active = values.filter((v) => v > 0).sort((a, b) => a - b);
+	const round2 = (v) => { const m = 10 ** (Math.floor(Math.log10(v)) - 1); return Math.round(v / m) * m; };
+	const cuts = active.length
+		? [...new Set([0.2, 0.4, 0.6, 0.8].map((q) => round2(active[Math.floor(q * active.length)])))].filter((c) => c > active[0] && c <= active.at(-1))
+		: [];
+	const step = (i) => (cuts.length ? 1 + Math.round((i * 4) / cuts.length) : 3);
+	const bucketLabel = (i) => (!cuts.length ? 'Any usage' : i ? `${format(cuts[i - 1])}+` : `< ${format(cuts[0])}`);
+	return {
+		level: (v) => (v > 0 ? step(cuts.filter((c) => v >= c).length) : 0),
+		legend: [[0, 'No usage'], ...(active.length ? [...Array(cuts.length + 1).keys()].map((i) => [step(i), bucketLabel(i)]) : [])],
+	};
+}
+
+const HEAT_GAP = 3;
+
+/**
+ * Shared heatmap grid. values: Map of cell key to number. detail(key): tooltip rows [{ label, color, value }].
+ * layout(width) returns { left, top, pitchX, pitchY, cols, rows, labels, keyAt(col, row) }, where keyAt
+ * gives null for a cell that shouldn't be drawn.
+ */
+function heatGrid(host, { values, format = fmtUSD, color, detail, title, onClick, label = '', layout }) {
+	host._chart?.destroy();
+	if (color) host.style.setProperty('--heat', color);
+	const tip = h('<div class="chart-tip" hidden></div>');
+	const scale = heatScale([...values.values()], format);
+	const legend = `<div class="legend">${scale.legend.map(([l, text]) => `<span><i class="swatch" style="background:var(--h${l})"></i>${esc(text)}</span>`).join('')}</div>`;
+	let geo = null;
+
+	function draw() {
+		const W = host.clientWidth;
+		if (!W) return;
+		geo = layout(W);
+		const { left, top, pitchX, pitchY, cols, rows, labels, keyAt } = geo;
+		const cellW = pitchX - HEAT_GAP, cellH = pitchY - HEAT_GAP;
+		const out = [labels];
+		for (let c = 0; c < cols; c++) {
+			for (let r = 0; r < rows; r++) {
+				const k = keyAt(c, r);
+				if (k != null) out.push(`<rect x="${left + c * pitchX}" y="${top + r * pitchY}" width="${cellW}" height="${cellH}" rx="3" style="fill:var(--h${scale.level(values.get(k) ?? 0)})"/>`);
+			}
+		}
+		out.push(`<rect class="hm-hl" width="${cellW}" height="${cellH}" rx="3" fill="none" visibility="hidden" style="stroke:var(--ink)"/>`);
+		const H = top + pitchY * rows - HEAT_GAP;
+		host.innerHTML = `<svg width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" role="img" aria-label="${esc(label)}">${out.join('')}</svg>${legend}`;
+		host.append(tip);
+	}
+
+	function cellAt(e) {
+		if (!geo) return null;
+		const b = host.getBoundingClientRect();
+		const c = Math.floor((e.clientX - b.left - geo.left) / geo.pitchX);
+		const r = Math.floor((e.clientY - b.top - geo.top) / geo.pitchY);
+		if (c < 0 || c >= geo.cols || r < 0 || r >= geo.rows) return null;
+		const key = geo.keyAt(c, r);
+		return key == null ? null : { c, r, key };
+	}
+
+	const onLeave = () => {
+		tip.hidden = true;
+		host.querySelector('.hm-hl')?.setAttribute('visibility', 'hidden');
+		host.style.cursor = '';
+	};
+
+	function onMove(e) {
+		const cell = cellAt(e);
+		if (!cell) return onLeave();
+		const v = values.get(cell.key) ?? 0;
+		const hl = host.querySelector('.hm-hl');
+		hl.setAttribute('x', geo.left + cell.c * geo.pitchX);
+		hl.setAttribute('y', geo.top + cell.r * geo.pitchY);
+		hl.removeAttribute('visibility');
+		tip.innerHTML = tipHtml(title(cell.key), v > 0 ? detail(cell.key) : [], format);
+		tip.hidden = false;
+		placeTip(tip, host, e);
+		host.style.cursor = onClick && v > 0 ? 'pointer' : '';
+	}
+
+	const onClickHandler = (e) => {
+		const cell = cellAt(e);
+		if (cell && (values.get(cell.key) ?? 0) > 0) onClick(cell.key);
+	};
+	host.addEventListener('mousemove', onMove);
+	host.addEventListener('mouseleave', onLeave);
+	if (onClick) host.addEventListener('click', onClickHandler);
+	const ro = new ResizeObserver(() => draw());
+	ro.observe(host);
+	draw();
+
+	const chart = {
+		update: draw,
+		destroy() {
+			ro.disconnect();
+			host.removeEventListener('mousemove', onMove);
+			host.removeEventListener('mouseleave', onLeave);
+			host.removeEventListener('click', onClickHandler);
+			host._chart = null;
+		},
+	};
+	host._chart = chart;
+	return chart;
+}
+
+/**
+ * Calendar heatmap: one column per week (Monday first), newest week on the right,
+ * showing as many trailing weeks of start..end as fit the width. Cell keys are 'YYYY-MM-DD'.
+ */
+export function calendarHeatmap(host, { start, end, values, ...opts }) {
+	const monday = (key) => { const d = new Date(`${key}T12:00`); return addDays(d, -((d.getDay() + 6) % 7)); };
+	const lastWeek = monday(end);
+	const totalWeeks = Math.round((lastWeek - monday(start)) / 6048e5) + 1;
+	const left = 32, top = 18;
+	return heatGrid(host, {
+		...opts,
+		values: new Map([...values].filter(([k]) => k >= start && k <= end)),
+		title: (k) => new Date(`${k}T12:00`).toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric' }),
+		layout(W) {
+			const cols = Math.max(1, Math.min(totalWeeks, Math.floor((W - left) / 12)));
+			const pitch = Math.min(26, (W - left) / cols);
+			const first = addDays(lastWeek, -7 * (cols - 1));
+			const labels = [];
+			const months = [];
+			for (let c = 0; c < cols; c++) {
+				const d = addDays(first, c * 7);
+				if (!months.length || d.getMonth() !== months.at(-1).d.getMonth()) months.push({ c, d });
+			}
+			if (months.length > 1 && (months[1].c - months[0].c) * pitch < 28) months.shift();
+			for (const { c, d } of months) labels.push(`<text x="${left + c * pitch}" y="11" class="ct">${esc(d.toLocaleDateString(undefined, { month: 'short' }))}</text>`);
+			for (const r of [0, 2, 4]) labels.push(`<text x="${left - 6}" y="${top + r * pitch + (pitch - HEAT_GAP) / 2 + 4}" text-anchor="end" class="ct">${esc(addDays(first, r).toLocaleDateString(undefined, { weekday: 'short' }))}</text>`);
+			return {
+				left, top, pitchX: pitch, pitchY: pitch, cols, rows: 7, labels: labels.join(''),
+				keyAt(c, r) {
+					const k = dayKey(addDays(first, c * 7 + r));
+					return k < start || k > end ? null : k;
+				},
+			};
+		},
+	});
+}
+
+// January 2024 starts on a Monday, so day 0 of this reference week is Monday.
+const weekTime = (day, hour = 0) => new Date(2024, 0, 1 + day, hour);
+const hourFormat = new Intl.DateTimeFormat(undefined, { hour: 'numeric' });
+
+export const weekHourLabel = (day, hour) => `${weekTime(day).toLocaleDateString(undefined, { weekday: 'short' })} ${hourFormat.formatRange(weekTime(day, hour), weekTime(day, hour + 1))}`;
+
+/** Punch-card heatmap: weekdays down (Monday first), hours across. Cell keys are 'day:hour'. */
+export function hourHeatmap(host, opts) {
+	const left = 36, top = 18, pitchY = 24;
+	return heatGrid(host, {
+		...opts,
+		title: (k) => { const [d, hr] = k.split(':').map(Number); return weekHourLabel(d, hr); },
+		layout(W) {
+			const pitchX = (W - left) / 24;
+			const every = [1, 2, 3, 4, 6].find((n) => n * pitchX >= 36) ?? 12;
+			const labels = [];
+			for (let hr = 0; hr < 24; hr += every) labels.push(`<text x="${left + hr * pitchX}" y="11" class="ct">${esc(hourFormat.format(weekTime(0, hr)))}</text>`);
+			for (let d = 0; d < 7; d++) labels.push(`<text x="${left - 6}" y="${top + d * pitchY + (pitchY - HEAT_GAP) / 2 + 4}" text-anchor="end" class="ct">${esc(weekTime(d).toLocaleDateString(undefined, { weekday: 'short' }))}</text>`);
+			return { left, top, pitchX, pitchY, cols: 24, rows: 7, labels: labels.join(''), keyAt: (c, r) => `${r}:${c}` };
+		},
+	});
 }
 
 export function legendHtml(series, chart) {
