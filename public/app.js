@@ -68,7 +68,7 @@ const main = () => $('#main');
 
 async function render() {
 	const id = ++state.renderId;
-	clearInterval(state.timer);
+	clearTimeout(state.timer);
 	destroyCharts(main());
 	const { view, path, params } = parseHash();
 	modelKind = view === 'r' && path.length > 1 ? `model:${path[0]}` : 'model';
@@ -163,7 +163,14 @@ async function renderOverview(id) {
 		<div class="grid" style="margin-top:14px"><div class="card" id="sessions-card"></div></div>`;
 	$('#auto').onchange = (e) => { store.set('autoRefresh', e.target.checked); render(); };
 	$('#refresh').onclick = () => load(true);
-	if (auto) state.timer = setInterval(() => document.visibilityState === 'visible' && load(false), 60_000);
+	// Scheduled from the end of each load, so a slow load never overlaps the next one.
+	const schedule = () => {
+		if (!auto || id !== state.renderId) return;
+		state.timer = setTimeout(async () => {
+			if (document.visibilityState === 'visible') await load(false).catch(() => {});
+			schedule();
+		}, 60_000);
+	};
 
 	async function load(fresh) {
 		// Awaited after the rest so a slow first transcript read doesn't hold back the other cards.
@@ -203,6 +210,7 @@ async function renderOverview(id) {
 		} else ['#block-card', '#hours-card'].forEach((s) => fail(s, activity));
 	}
 	await load(false);
+	schedule();
 }
 
 function agentSplit(rows) {

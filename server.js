@@ -14,6 +14,10 @@ const require = createRequire(import.meta.url);
 const HOST = process.env.HOST || '127.0.0.1';
 const PORT = Number(process.env.PORT || 4646);
 const CACHE_MS = 20_000;
+// ccusage re-parses every transcript on each run and uses every core, so a slow run is reused for
+// at least this many times its own duration. That caps its CPU share at about 1/CACHE_RUN_FACTOR.
+const CACHE_RUN_FACTOR = 10;
+const MAX_CONCURRENT_RUNS = 1;
 
 // Flags the server owns; the UI never sets these directly.
 const SERVER_FLAGS = new Set(['help', 'version', 'color', 'no-color', 'json']);
@@ -30,13 +34,27 @@ function resolveCcusage() {
 const CC = resolveCcusage();
 const CC_VERSION = require('ccusage/package.json').version;
 
-function run(args, { stdin, color = false, timeout = 120_000 } = {}) {
+let running = 0;
+const waiting = [];
+async function run(args, opts) {
+	if (running >= MAX_CONCURRENT_RUNS) await new Promise((r) => waiting.push(r));
+	running++;
+	try {
+		return await spawnCcusage(args, opts);
+	} finally {
+		running--;
+		waiting.shift()?.();
+	}
+}
+
+function spawnCcusage(args, { stdin, color = false, timeout = 300_000 } = {}) {
 	return new Promise((resolve) => {
 		const started = Date.now();
 		const env = { ...process.env, COLUMNS: '240' };
 		if (color) env.FORCE_COLOR = '1';
 		else { delete env.FORCE_COLOR; env.NO_COLOR = '1'; }
 		const child = spawn(CC.cmd, [...CC.pre, ...args], { env, windowsHide: true });
+		try { os.setPriority(child.pid, os.constants.priority.PRIORITY_LOW); } catch {}
 		let stdout = '', stderr = '';
 		child.stdout.setEncoding('utf8').on('data', (d) => (stdout += d));
 		child.stderr.setEncoding('utf8').on('data', (d) => (stderr += d));
@@ -203,13 +221,19 @@ async function claudeActivity({ flags = {}, fresh }) {
 // ---------- HTTP ----------
 
 const cache = new Map();
+const inFlight = new Map();
 async function cachedRun(args, opts, fresh) {
 	const key = JSON.stringify([args, opts.color, opts.stdin ?? null]);
+	const pending = inFlight.get(key);
+	if (pending) return pending;
 	const hit = cache.get(key);
-	if (!fresh && hit && Date.now() - hit.at < CACHE_MS) return { ...hit.result, cached: true };
-	const result = await run(args, opts);
-	cache.set(key, { at: Date.now(), result });
-	return result;
+	const ttl = Math.max(CACHE_MS, hit?.result.code === 0 ? hit.result.ms * CACHE_RUN_FACTOR : 0);
+	if (!fresh && hit && Date.now() - hit.at < ttl) return { ...hit.result, cached: true };
+	const p = run(args, opts)
+		.then((result) => { cache.set(key, { at: Date.now(), result }); return result; })
+		.finally(() => inFlight.delete(key));
+	inFlight.set(key, p);
+	return p;
 }
 
 const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.svg': 'image/svg+xml', '.json': 'application/json' };
