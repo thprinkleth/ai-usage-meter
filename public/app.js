@@ -134,6 +134,7 @@ function buildSidebar() {
 // ---------- overview ----------
 
 const READING_TRANSCRIPTS = '<div class="center"><span class="spinner"></span>Reading Claude transcripts…</div>';
+const LOADING = '<div class="center"><span class="spinner"></span>Loading…</div>';
 
 async function renderOverview(id) {
 	const auto = store.get('autoRefresh', true);
@@ -141,54 +142,53 @@ async function renderOverview(id) {
 		<div class="topbar">
 			<div><h1>Overview</h1><div class="sub">Every agent ccusage detects, with Claude Code and Codex up front</div></div>
 			<div class="spacer"></div>
+			<span class="sub" id="updated"></span>
 			<label class="check"><input type="checkbox" id="auto" ${auto ? 'checked' : ''}> Auto-refresh (60s)</label>
 			<button class="btn" id="refresh">${ICONS.refresh}Refresh</button>
 		</div>
 		<div class="grid cols-4" id="tiles"><div class="card span-all center"><span class="spinner"></span>Loading usage…</div></div>
 		<div class="grid cols-3" style="margin-top:14px">
-			<div class="card span-2" id="daily-card"></div>
+			<div class="card span-2" id="daily-card">${LOADING}</div>
 			<div class="card block-card" id="block-card">${READING_TRANSCRIPTS}</div>
 		</div>
-		<div class="grid" style="margin-top:14px"><div class="card" id="heat-card"></div></div>
+		<div class="grid" style="margin-top:14px"><div class="card" id="heat-card">${LOADING}</div></div>
 		<div class="grid" style="margin-top:14px"><div class="card" id="hours-card">${READING_TRANSCRIPTS}</div></div>
 		<div class="grid cols-3" style="margin-top:14px">
-			<div class="card" id="agents-card"></div>
-			<div class="card" id="models-card"></div>
-			<div class="card" id="tokens-card"></div>
+			<div class="card" id="agents-card">${LOADING}</div>
+			<div class="card" id="models-card">${LOADING}</div>
+			<div class="card" id="tokens-card">${LOADING}</div>
 		</div>
 		<div class="grid cols-3" style="margin-top:14px">
-			<div class="card span-2" id="monthly-card"></div>
-			<div class="card" id="projects-card"></div>
+			<div class="card span-2" id="monthly-card">${LOADING}</div>
+			<div class="card" id="projects-card">${LOADING}</div>
 		</div>
-		<div class="grid" style="margin-top:14px"><div class="card" id="sessions-card"></div></div>`;
+		<div class="grid" style="margin-top:14px"><div class="card" id="sessions-card">${LOADING}</div></div>`;
 	$('#auto').onchange = (e) => { store.set('autoRefresh', e.target.checked); render(); };
 	$('#refresh').onclick = () => load(true);
-	// Scheduled from the end of each load, so a slow load never overlaps the next one.
-	const schedule = () => {
-		if (!auto || id !== state.renderId) return;
+	// Scheduled from the end of each load, so a slow load never overlaps the next one. While the
+	// server is still refreshing stale data, check back soon to swap the fresh numbers in.
+	const schedule = (soon) => {
+		if (id !== state.renderId || (!auto && !soon)) return;
 		state.timer = setTimeout(async () => {
-			if (document.visibilityState === 'visible') await load(false).catch(() => {});
-			schedule();
-		}, 60_000);
+			const again = document.visibilityState === 'visible' ? await load(false).catch(() => false) : soon;
+			schedule(again);
+		}, soon ? 5_000 : 60_000);
 	};
 
 	async function load(fresh) {
-		// Awaited after the rest so a slow first transcript read doesn't hold back the other cards.
-		const activityResult = api('/api/claude/activity', { fresh }).then((value) => ({ value }), (reason) => ({ reason }));
-		const [daily, monthly, sessions, claudeSessions] = await Promise.allSettled([
-			runReport(['daily'], { 'by-agent': true }, { fresh }),
-			runReport(['monthly'], { 'by-agent': true }, { fresh }),
-			runReport(['session'], {}, { fresh }),
-			runReport(['claude', 'session'], {}, { fresh }),
-		]);
-		if (id !== state.renderId) return;
-		destroyCharts(main());
-		const fail = (sel, r) => ($(sel).innerHTML = `<div class="err">${esc(r.reason?.message ?? 'Failed')}</div>`);
+		const live = () => id === state.renderId;
+		const fail = (sels, e) => sels.forEach((s) => ($(s).innerHTML = `<div class="err">${esc(e?.message ?? 'Failed')}</div>`));
+		const responses = [];
+		const rowsOf = (r) => normalizeReport(r.data).sections[0].rows;
+		const DAILY_CARDS = ['#tiles', '#daily-card', '#heat-card', '#agents-card', '#models-card', '#tokens-card'];
 
-		if (daily.status === 'fulfilled') {
-			const rows = normalizeReport(daily.value.data).sections[0].rows;
+		const daily = runReport(['daily'], { 'by-agent': true }, { fresh });
+		const dailyShown = daily.then((r) => {
+			responses.push(r);
+			if (!live()) return;
+			const rows = rowsOf(r);
 			const mt = new Map();
-			for (const r of rows) for (const m of r.models) mt.set(m.name, (mt.get(m.name) ?? 0) + (m.cost ?? 0));
+			for (const row of rows) for (const m of row.models) mt.set(m.name, (mt.get(m.name) ?? 0) + (m.cost ?? 0));
 			registerModels(mt);
 			overviewTiles(rows);
 			overviewDaily(rows);
@@ -196,21 +196,31 @@ async function renderOverview(id) {
 			overviewAgents(rows);
 			overviewModels(mt);
 			overviewTokens(rows);
-		} else ['#tiles', '#daily-card', '#heat-card', '#agents-card', '#models-card', '#tokens-card'].forEach((s) => fail(s, daily));
-		if (monthly.status === 'fulfilled') overviewMonthly(normalizeReport(monthly.value.data).sections[0].rows); else fail('#monthly-card', monthly);
-		if (sessions.status === 'fulfilled') overviewSessions(normalizeReport(sessions.value.data).sections[0].rows); else fail('#sessions-card', sessions);
-		if (claudeSessions.status === 'fulfilled') overviewProjects(normalizeReport(claudeSessions.value.data).sections[0].rows); else fail('#projects-card', claudeSessions);
+		}, (e) => live() && fail(DAILY_CARDS, e));
 
-		const activity = await activityResult;
-		if (id !== state.renderId) return;
-		if (activity.value) {
-			$('#block-card').innerHTML = activeBlockHtml(activity.value.data.blocks.find((b) => b.isActive), null, true);
-			state.hours = activity.value.hours;
-			overviewHours();
-		} else ['#block-card', '#hours-card'].forEach((s) => fail(s, activity));
+		// Each card renders as soon as its own report lands, but after the daily one, which assigns model colors.
+		const card = (request, sels, show) => Promise.all([request, dailyShown]).then(([r]) => {
+			responses.push(r);
+			if (live()) show(r);
+		}, (e) => live() && fail(sels, e));
+
+		await Promise.all([
+			dailyShown,
+			card(api('/api/claude/activity', { fresh }), ['#block-card', '#hours-card'], (r) => {
+				$('#block-card').innerHTML = activeBlockHtml(r.data.blocks.find((b) => b.isActive), null, true);
+				state.hours = r.hours;
+				overviewHours();
+			}),
+			card(runReport(['monthly'], { 'by-agent': true }, { fresh }), ['#monthly-card'], (r) => overviewMonthly(rowsOf(r))),
+			card(runReport(['claude', 'session'], {}, { fresh }), ['#projects-card'], (r) => overviewProjects(rowsOf(r))),
+			card(runReport(['session'], {}, { fresh }), ['#sessions-card'], (r) => overviewSessions(rowsOf(r))),
+		]);
+		const refreshing = responses.some((r) => r.refreshing);
+		const age = Math.max(0, ...responses.map((r) => r.age ?? 0));
+		if (live()) $('#updated').textContent = refreshing ? `Showing data from ${fmtDuration(age / 6e4)} ago · updating…` : '';
+		return refreshing;
 	}
-	await load(false);
-	schedule();
+	schedule(await load(false));
 }
 
 function agentSplit(rows) {
@@ -634,7 +644,7 @@ async function renderExplorer(path, params, id) {
 			const useExactBlocks = view === 'visual' && hasExactBlocks(cmd);
 			const r = await api(useExactBlocks ? '/api/claude/activity' : '/api/run', { command: cmd.path, flags, json: view !== 'terminal', fresh });
 			if (my !== seq || id !== state.renderId) return;
-			const meta = `<div class="toolbar" style="margin-bottom:10px;color:var(--muted);font-size:12.5px"><span>exit ${r.code} · ${r.ms} ms${r.cached ? ' · cached' : ''}</span><div class="spacer" style="flex:1"></div>
+			const meta = `<div class="toolbar" style="margin-bottom:10px;color:var(--muted);font-size:12.5px"><span>exit ${r.code} · ${r.ms} ms${r.cached ? ` · cached ${fmtDuration((r.age ?? 0) / 6e4)} ago` : ''}${r.refreshing ? ' · updating in background, Run again for fresh data' : ''}</span><div class="spacer" style="flex:1"></div>
 				${view !== 'terminal' && r.data ? `<button class="btn small" id="dl-json">${ICONS.download}JSON</button>` : ''}
 				${view === 'visual' && r.data ? `<button class="btn small" id="dl-csv">${ICONS.download}CSV</button>` : ''}
 				${view === 'terminal' ? `<button class="btn small" id="copy-out">${ICONS.copy}Copy output</button>` : ''}</div>`;

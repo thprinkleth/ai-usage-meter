@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { spawn } from 'node:child_process';
 import { existsSync, readFileSync, statSync } from 'node:fs';
-import { readdir, stat } from 'node:fs/promises';
+import { mkdir, readdir, rename, stat, unlink, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { createRequire } from 'node:module';
 import os from 'node:os';
@@ -54,7 +54,8 @@ function spawnCcusage(args, { stdin, color = false, timeout = 300_000 } = {}) {
 		if (color) env.FORCE_COLOR = '1';
 		else { delete env.FORCE_COLOR; env.NO_COLOR = '1'; }
 		const child = spawn(CC.cmd, [...CC.pre, ...args], { env, windowsHide: true });
-		try { os.setPriority(child.pid, os.constants.priority.PRIORITY_LOW); } catch {}
+		// Idle priority starved runs whenever anything else was busy; below-normal still yields to foreground apps.
+		try { os.setPriority(child.pid, os.constants.priority.PRIORITY_BELOW_NORMAL); } catch {}
 		let stdout = '', stderr = '';
 		child.stdout.setEncoding('utf8').on('data', (d) => (stdout += d));
 		child.stderr.setEncoding('utf8').on('data', (d) => (stderr += d));
@@ -215,25 +216,91 @@ async function claudeActivity({ flags = {}, fresh }) {
 	if (r.code !== 0) throw new Error((r.stderr || r.stdout || `ccusage exited with ${r.code}`).trim());
 	const windowHours = Number(flags['session-length']) > 0 ? Number(flags['session-length']) : 5;
 	const { blocks, hours } = claudeUsage.activity(JSON.parse(r.stdout).blocks ?? [], { windowHours });
-	return { code: 0, stdout: '', stderr: r.stderr, ms: Date.now() - started, data: { blocks: selectBlocks(blocks, flags) }, hours };
+	return { code: 0, stdout: '', stderr: r.stderr, ms: Date.now() - started, cached: r.cached, age: r.age, refreshing: r.refreshing, data: { blocks: selectBlocks(blocks, flags) }, hours };
+}
+
+function runReport(cmd, flags, json, fresh) {
+	const args = buildArgs(cmd, flags);
+	const wantJson = json && cmd.flags.some((f) => f.name === 'json');
+	if (wantJson) args.push('--json');
+	else if (cmd.flags.some((f) => f.name === 'color')) args.push('--color');
+	return { args, wantJson, result: cachedRun(args, { color: !wantJson }, fresh) };
+}
+
+// Must match what the overview page requests, so these runs are the ones it reuses.
+const OVERVIEW_REPORTS = [[['daily'], { 'by-agent': true }], [['monthly'], { 'by-agent': true }], [['claude', 'session'], {}], [['session'], {}]];
+
+function prewarm() {
+	const [first, ...rest] = OVERVIEW_REPORTS;
+	const start = ([cmdPath, flags]) => { const cmd = findCommand(cmdPath); if (cmd) runReport(cmd, flags, true).result.catch(() => {}); };
+	start(first);
+	claudeActivity({}).catch(() => {});
+	rest.forEach(start);
 }
 
 // ---------- HTTP ----------
 
+// Stale-while-revalidate: any earlier result is returned at once and refreshed in the background,
+// so only the very first run of a report ever makes the page wait for ccusage.
 const cache = new Map();
 const inFlight = new Map();
-async function cachedRun(args, opts, fresh) {
-	const key = JSON.stringify([args, opts.color, opts.stdin ?? null]);
-	const pending = inFlight.get(key);
-	if (pending) return pending;
-	const hit = cache.get(key);
-	const ttl = Math.max(CACHE_MS, hit?.result.code === 0 ? hit.result.ms * CACHE_RUN_FACTOR : 0);
-	if (!fresh && hit && Date.now() - hit.at < ttl) return { ...hit.result, cached: true };
-	const p = run(args, opts)
-		.then((result) => { cache.set(key, { at: Date.now(), result }); return result; })
+
+function refreshRun(key, args, opts) {
+	let p = inFlight.get(key);
+	if (p) return p;
+	p = run(args, opts)
+		.then((result) => {
+			const prev = cache.get(key);
+			// A failed refresh keeps the last good data, but still counts as checked so it isn't retried in a loop.
+			cache.set(key, { at: Date.now(), result: result.code === 0 || !prev ? result : prev.result });
+			if (result.code === 0) saveCacheSoon();
+			return result;
+		})
 		.finally(() => inFlight.delete(key));
 	inFlight.set(key, p);
 	return p;
+}
+
+async function cachedRun(args, opts, fresh) {
+	const key = JSON.stringify([args, opts.color, opts.stdin ?? null]);
+	const hit = cache.get(key);
+	if (fresh || !hit) return refreshRun(key, args, opts);
+	const ttl = Math.max(CACHE_MS, hit.result.code === 0 ? hit.result.ms * CACHE_RUN_FACTOR : 0);
+	if (Date.now() - hit.at >= ttl) refreshRun(key, args, opts).catch(() => {});
+	return { ...hit.result, cached: true, age: Date.now() - hit.at, refreshing: inFlight.has(key) };
+}
+
+function cacheFile() {
+	const base = process.platform === 'win32' ? process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local')
+		: process.platform === 'darwin' ? path.join(os.homedir(), 'Library', 'Caches')
+		: process.env.XDG_CACHE_HOME || path.join(os.homedir(), '.cache');
+	return path.join(base, 'ai-usage-meter', 'runs.json');
+}
+const CACHE_FILE = cacheFile();
+const CACHE_FILE_ENTRIES = 40;
+
+function loadCache() {
+	try {
+		const saved = JSON.parse(readFileSync(CACHE_FILE, 'utf8'));
+		if (saved.version !== CC_VERSION) return;
+		for (const [key, entry] of saved.entries) cache.set(key, entry);
+	} catch {}
+}
+
+let saveTimer = null;
+function saveCacheSoon() {
+	clearTimeout(saveTimer);
+	saveTimer = setTimeout(async () => {
+		const entries = [...cache].filter(([, e]) => e.result.code === 0).sort((a, b) => b[1].at - a[1].at).slice(0, CACHE_FILE_ENTRIES);
+		const tmp = `${CACHE_FILE}.${process.pid}.tmp`;
+		try {
+			await mkdir(path.dirname(CACHE_FILE), { recursive: true });
+			await writeFile(tmp, JSON.stringify({ version: CC_VERSION, entries }));
+			await rename(tmp, CACHE_FILE);
+		} catch {
+			await unlink(tmp).catch(() => {});
+		}
+	}, 2000);
 }
 
 const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.svg': 'image/svg+xml', '.json': 'application/json' };
@@ -276,11 +343,8 @@ const server = createServer(async (req, res) => {
 			if (url.pathname === '/api/run') {
 				const cmd = findCommand(body.command || []);
 				if (!cmd) return send(res, 400, { error: `Unknown command "${(body.command || []).join(' ')}"` });
-				const args = buildArgs(cmd, body.flags);
-				const wantJson = body.json && cmd.flags.some((f) => f.name === 'json');
-				if (wantJson) args.push('--json');
-				else if (cmd.flags.some((f) => f.name === 'color')) args.push('--color');
-				const r = await cachedRun(args, { color: !wantJson }, body.fresh);
+				const { args, wantJson, result } = runReport(cmd, body.flags, body.json, body.fresh);
+				const r = await result;
 				let data = null;
 				if (wantJson && r.code === 0) { try { data = JSON.parse(r.stdout); } catch {} }
 				return send(res, 200, { args, command: `ccusage ${args.join(' ')}`, ...r, data });
@@ -335,11 +399,12 @@ function listen(port, attemptsLeft) {
 		const url = `http://${HOST === '0.0.0.0' ? 'localhost' : HOST}:${port}`;
 		console.log(`AI Usage Meter → ${url}  (ccusage ${catalog.version}, ${catalog.commands.length} commands)`);
 		if (process.argv.includes('--open') || (process.env.OPEN && process.env.OPEN !== '0')) openBrowser(url);
-		// The first full read can take seconds; start now so the first page load doesn't wait for all of it.
-		claudeUsage.scan().catch(() => {});
+		// Start the overview's reports now so the first page load finds them running or done.
+		prewarm();
 	});
 }
 
+loadCache();
 buildCatalog()
 	.then(() => listen(PORT, 10))
 	.catch((e) => {
